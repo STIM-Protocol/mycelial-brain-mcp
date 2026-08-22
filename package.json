@@ -1,0 +1,21 @@
+{
+  "name": "mycelial-brain-mcp",
+  "version": "3.1.0",
+  "description": "Mycelial Brain MCP server: persistent, decentralized context memory for AI agents. Part of the STIM Protocol ecosystem.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "deploy": "gcloud run deploy mycelial-brain-mcp --source . --region us-central1"
+  },
+  "keywords": ["mcp", "brain", "ai-memory", "stim", "context", "model-context-protocol", "agent-memory"],
+  "author": "George Steward",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/STIM-Protocol/mycelial-brain-mcp"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.0.0",
+    "express": "^4.18.0"
+  }
+}

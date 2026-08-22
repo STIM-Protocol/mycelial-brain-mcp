@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mycelial Brain MCP</title>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="bg-mesh"></div>
+    <div class="grid-overlay"></div>
+
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <a href="#" class="logo">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent-color)"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                Mycelial<span>Brain</span>
+            </a>
+            <a href="https://github.com/soilgrowerx/mycelial-brain-mcp" class="btn btn-secondary" style="padding: 0.6rem 1.2rem; font-size: 0.9rem;">View on GitHub</a>
+        </header>
+
+        <!-- Hero -->
+        <section class="hero">
+            <div class="badge">Model Context Protocol Server</div>
+            <h1>Persistent Memory for<br>Agentic Ecosystems</h1>
+            <p>Mycelial Brain is an open-source, decentralized memory ledger built on the STIM Protocol. It provides a standardized MCP interface for autonomous AI agents to share, search, and synchronize context over Google Cloud Storage.</p>
+            
+            <div class="cta-group">
+                <a href="#quickstart" class="btn btn-primary">Quickstart Guidelines</a>
+                <a href="#stim" class="btn btn-secondary">Read STIM Specs</a>
+            </div>
+
+            <!-- Terminal Window -->
+            <div class="code-window" id="quickstart">
+                <div class="code-header">
+                    <div class="traffic-light red"></div>
+                    <div class="traffic-light yellow"></div>
+                    <div class="traffic-light green"></div>
+                </div>
+                <pre><code><span style="color: #94a3b8;">// Initialize connection to the Brain MCP</span>
+const mcpPayload = {
+  jsonrpc: "2.0",
+  method: "tools/call",
+  params: {
+    name: "<span style="color: var(--accent-color);">brain_search</span>",
+    arguments: { 
+      query: "architecture docs", 
+      limit: 5 
+    }
+  }
+};
+
+<span style="color: #94a3b8;">// Fetch utilizing advanced token matching & tag taxonomy</span>
+const response = await fetch(MYCELIAL_BRAIN_URL, {
+  method: 'POST',
+  body: JSON.stringify(mcpPayload)
+});</code></pre>
+            </div>
+        </section>
+
+        <!-- Features Grid -->
+        <section class="features">
+            <div class="feature-card">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+                <h3>GCS Persistence</h3>
+                <p>Stores raw operational documents seamlessly across Google Cloud Storage, abstracting away infra logic. No database needed—pure cloud-native object structures.</p>
+            </div>
+            
+            <div class="feature-card">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                <h3>Tokenized Search</h3>
+                <p>Native query splitting and multi-layered scoring algorithms prioritize both exact tag taxonomy constraints and internal string content matrices.</p>
+            </div>
+
+            <div class="feature-card">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+                <h3>STIM Validated</h3>
+                <p>Engineered expressly for Stasis Through Inferred Memory (STIM) environments. Ensures your agent pipelines don't overwrite identity but accumulate chronological history.</p>
+            </div>
+        </section>
+
+        <!-- Deep Architecture -->
+        <section class="stim-section" id="stim">
+            <div class="architecture-grid">
+                <div>
+                    <h2>The STIM Protocol</h2>
+                    <p>The "Stasis Through Inferred Memory" (STIM) protocol enforces a strict ruleset for AI personas. Instead of modifying core instructions, agents build dynamic identity by retrieving relevant situational context from the Mycelial Brain.</p>
+                    <p style="margin-top: 1rem; color: #fff;"><strong>Core Capabilities:</strong></p>
+                    <ul style="list-style: none; color: var(--text-secondary); margin-top: 1rem; display: flex; flex-direction: column; gap: 0.8rem;">
+                        <li><strong style="color: var(--accent-color);">brain_write</strong>: Insert new chronological intelligence into the graph.</li>
+                        <li><strong style="color: var(--accent-color);">brain_search</strong>: Fetch documents scored by rigorous query token rules.</li>
+                        <li><strong style="color: var(--accent-color);">brain_read</strong>: Directly stream targeted assets bypassing search inference.</li>
+                        <li><strong style="color: var(--accent-color);">brain_list</strong>: Compile the index for offline ingestion vectors.</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-card" style="background: rgba(0,0,0,0.4); padding: 2rem;">
+                    <h3 style="margin-bottom: 1rem; font-size: 1.2rem;">Native Integration</h3>
+                    <p style="font-size: 0.95rem;">Compatible with any client that speaks JSON-RPC 2.0. Whether you are building in Go, TypeScript, or Python, the Brain serves as your central repository.</p>
+                    <a href="https://github.com/soilgrowerx/mycelial-brain-mcp" style="color: var(--accent-color); text-decoration: none; font-family: var(--font-mono); font-size: 0.9rem; margin-top: 1rem; display: inline-block;">Explore the repository →</a>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Mycelial Brain MCP. Crafted for Sovereign Agentic Operations.</p>
+        </footer>
+    </div>
+</body>
+</html>
