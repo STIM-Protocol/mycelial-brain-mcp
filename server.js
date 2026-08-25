@@ -8,7 +8,7 @@ const BUCKET = process.env.GCS_BUCKET_NAME || 'mycelial-brain-storage';
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 const PROTOCOL_VERSION = '2026-07-28';
 const COUNTER_FILE = '_sequence.counter';
-const COUNTER_INIT = 405;
+const COUNTER_INIT = 413;
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -70,7 +70,7 @@ function extractTitleAndTimestamp(content) {
 }
 
 function makeEntry(doc, fileName) {
-  const docPath = doc.path || (fileName ? fileName.replace(/\.json$/, '') : '');
+  const rawPath = doc.path || (fileName ? fileName.replace(/\.json$/, '') : '');
   const content = doc.content || '';
   const tags = Array.isArray(doc.tags) ? doc.tags : [];
   const meta = extractTitleAndTimestamp(content);
@@ -86,7 +86,7 @@ function makeEntry(doc, fileName) {
   }
 
   return {
-    path: docPath,
+    path: rawPath,
     content: content,
     tags: tags,
     title: title,
@@ -95,7 +95,7 @@ function makeEntry(doc, fileName) {
     updated: updated,
     textLower: content.toLowerCase(),
     tagsLower: tags.join(' ').toLowerCase(),
-    pathLower: docPath.toLowerCase(),
+    pathLower: rawPath.toLowerCase(),
     titleLower: title.toLowerCase()
   };
 }
@@ -189,14 +189,14 @@ function authMiddleware(req, res, next) {
   return res.status(401).json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' } });
 }
 
-// Atomic sequential ID allocator
+// Atomic sequential ID allocator reading _sequence.counter first
 async function brain_allocate() {
   const counterFile = storage.bucket(BUCKET).file(COUNTER_FILE);
-  const MAX_RETRIES = 3;
+  const MAX_RETRIES = 5;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       const [contents, meta] = await counterFile.download();
-      const rawCurrent = parseInt(contents.toString()) || 0;
+      const rawCurrent = parseInt(contents.toString().trim(), 10) || 0;
       const current = Math.max(rawCurrent, COUNTER_INIT);
       const next = current + 1;
       const opts = { contentType: 'text/plain' };
@@ -209,20 +209,29 @@ async function brain_allocate() {
         await counterFile.save(COUNTER_INIT.toString(), { contentType: 'text/plain' });
         return `doc-${COUNTER_INIT + 1}`;
       }
-      if (e.code === 412 && attempt < MAX_RETRIES - 1) continue;
-      throw e;
+      if (e.code === 412 && attempt < MAX_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, 50 * Math.pow(2, attempt)));
+        continue;
+      }
+      console.warn('Counter read failed on attempt', attempt, e.message);
     }
   }
 
+  // Fallback: scan bucket index
+  console.warn('Falling back to bucket index scan for sequence allocation');
   const docs = await getDocIndex();
   const nums = Array.from(docs.keys())
     .map(p => {
-      const m = /^doc-(\d+)$/.exec(p);
+      const m = /^doc-(\d+)/.exec(p);
       return m ? parseInt(m[1], 10) : 0;
     })
-    .filter(n => !isNaN(n));
+    .filter(n => !isNaN(n) && n < 1000); // Filter out outlier tombstone IDs
   const maxNum = Math.max(COUNTER_INIT, ...nums, 0);
-  return `doc-${maxNum + 1}`;
+  const nextAlloc = maxNum + 1;
+  counterFile.save(nextAlloc.toString(), { contentType: 'text/plain' }).catch(err => {
+    console.error('Failed to sync counter during fallback:', err.message);
+  });
+  return `doc-${nextAlloc}`;
 }
 
 async function writeDoc(docPath, content, tags) {
@@ -233,17 +242,36 @@ async function writeDoc(docPath, content, tags) {
 }
 
 async function readDoc(docPath) {
-  try {
-    const [contents] = await storage.bucket(BUCKET).file(docPath + '.json').download();
-    return JSON.parse(contents);
-  } catch (e) {
+  if (docPath === '_sequence.counter' || docPath.endsWith('.counter')) {
     try {
-      const [contents] = await storage.bucket(BUCKET).file('brain/' + docPath + '.json').download();
-      return JSON.parse(contents);
-    } catch (e2) {
-      throw new Error(`Document not found: ${docPath}`);
+      const [contents] = await storage.bucket(BUCKET).file(COUNTER_FILE).download();
+      return { path: '_sequence.counter', content: contents.toString().trim() };
+    } catch (e) {
+      return { path: '_sequence.counter', content: String(COUNTER_INIT) };
     }
   }
+
+  const cleanPath = docPath.trim();
+  const candidatePaths = [
+    cleanPath + '.json',
+    cleanPath,
+    cleanPath + '.md.json',
+    cleanPath.replace(/\.md$/, '') + '.json',
+    cleanPath.replace(/\.md$/, '') + '.md.json',
+    'brain/' + cleanPath + '.json',
+    'brain/' + cleanPath + '.md.json'
+  ];
+
+  for (const p of candidatePaths) {
+    try {
+      const [contents] = await storage.bucket(BUCKET).file(p).download();
+      const parsed = JSON.parse(contents.toString());
+      if (parsed) return parsed;
+    } catch (e) {
+      // try next
+    }
+  }
+  throw new Error(`Document not found: ${docPath}`);
 }
 
 // Tokenized Case-Insensitive Search with Recency Weighting
@@ -253,7 +281,6 @@ async function searchDocs(query, limit) {
   const docs = Array.from(docsMap.values());
   const now = Date.now();
 
-  // Test 4: Empty query or "*" returns most recent docs
   if (!q || q === '*') {
     const sorted = [...docs].sort((a, b) => (b.timestampMs - a.timestampMs) || b.path.localeCompare(a.path));
     const effectiveLimit = limit || 20;
@@ -307,7 +334,7 @@ async function searchDocs(query, limit) {
   }
 
   const seqNum = p => {
-    const m = /^doc-(\d+)$/.exec(p);
+    const m = /^doc-(\d+)/.exec(p);
     return m ? +m[1] : 0;
   };
 
@@ -336,7 +363,7 @@ async function listDocs(args) {
   }
 
   const seqNum = p => {
-    const m = /^doc-(\d+)$/.exec(p);
+    const m = /^doc-(\d+)/.exec(p);
     return m ? +m[1] : Number.MAX_SAFE_INTEGER;
   };
 
@@ -384,6 +411,15 @@ app.get('/health', (_, res) => res.json({
   rebuildInFlight: !!rebuildPromise
 }));
 
+app.post('/rebuild', authMiddleware, async (_, res) => {
+  try {
+    const map = await rebuildCache();
+    return res.json({ status: 'ok', size: map.size, rebuildMs: lastRebuildMs });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/mcp', authMiddleware, async (req, res) => {
   const { method, params, id } = req.body || {};
   try {
@@ -421,7 +457,7 @@ app.post('/mcp', authMiddleware, async (req, res) => {
           inputSchema: {
             type: 'object',
             properties: {
-              path: { type: 'string', description: 'Path of the document to read (e.g. doc-397)' }
+              path: { type: 'string', description: 'Path of the document to read (e.g. doc-397, doc-412, _sequence.counter)' }
             },
             required: ['path']
           }
