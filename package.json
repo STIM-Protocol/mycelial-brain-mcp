@@ -1,6 +1,6 @@
 {
   "name": "mycelial-brain-mcp",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "Mycelial Brain MCP server: persistent, decentralized context memory for AI agents. Part of the STIM Protocol ecosystem.",
   "main": "server.js",
   "scripts": {

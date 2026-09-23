@@ -7,8 +7,19 @@ const storage = new Storage();
 const BUCKET = process.env.GCS_BUCKET_NAME || 'mycelial-brain-storage';
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 const PROTOCOL_VERSION = '2026-07-28';
+const SERVER_VERSION = '3.4.0';
 const COUNTER_FILE = '_sequence.counter';
 const COUNTER_INIT = 416;
+const INDEX_FILE = '_index.json';
+
+class DocNotFoundError extends Error {
+  constructor(docPath) {
+    super(`Document not found: ${docPath}`);
+    this.name = 'DocNotFoundError';
+    this.code = -32004;
+    this.docPath = docPath;
+  }
+}
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -30,8 +41,42 @@ let rebuildPromise = null;
 let lastRebuildMs = 0;
 const pendingWrites = new Map();
 
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours (refreshed incrementally and on writes)
 const FETCH_CONCURRENCY = 50;
+
+let saveIndexTimer = null;
+async function saveIndexFile() {
+  if (!docCache) return;
+  try {
+    const docs = Array.from(docCache.values()).map(d => ({
+      path: d.path,
+      content: d.content,
+      tags: d.tags,
+      title: d.title,
+      timestamp: d.timestamp,
+      updated: d.updated,
+      reserved: d.reserved
+    }));
+    const payload = JSON.stringify({
+      version: '1.0',
+      updated: new Date().toISOString(),
+      count: docs.length,
+      docs
+    });
+    const file = storage.bucket(BUCKET).file(INDEX_FILE);
+    await file.save(payload, { contentType: 'application/json' });
+    console.log(`Saved persistent index to GCS (${docs.length} docs)`);
+  } catch (e) {
+    console.error('Failed to save persistent index:', e.message);
+  }
+}
+
+function scheduleSaveIndex() {
+  if (saveIndexTimer) clearTimeout(saveIndexTimer);
+  saveIndexTimer = setTimeout(() => {
+    saveIndexFile().catch(() => {});
+  }, 5000);
+}
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'how', 'does', 'do', 'what',
@@ -118,24 +163,63 @@ async function mapLimit(items, limit, fn) {
 
 async function rebuildCache() {
   const started = Date.now();
+  let loadedFromIndex = false;
+  let indexUpdatedTime = null;
+  const next = new Map();
+
+  // 1. Try loading from persistent _index.json in GCS first
+  try {
+    const indexFile = storage.bucket(BUCKET).file(INDEX_FILE);
+    const [exists] = await indexFile.exists();
+    if (exists) {
+      const [contents] = await indexFile.download();
+      const parsed = JSON.parse(contents.toString());
+      if (parsed && Array.isArray(parsed.docs)) {
+        for (const doc of parsed.docs) {
+          if (doc && doc.path) {
+            next.set(doc.path, makeEntry(doc));
+          }
+        }
+        loadedFromIndex = true;
+        indexUpdatedTime = parsed.updated ? new Date(parsed.updated).getTime() : null;
+        console.log(`Loaded ${next.size} docs from persistent index in ${Date.now() - started}ms`);
+      }
+    }
+  } catch (e) {
+    console.warn('Persistent index read skipped/failed, falling back to bucket scan:', e.message);
+  }
+
+  // 2. Scan GCS bucket for files
   const [files] = await storage.bucket(BUCKET).getFiles();
   const jsonFiles = files.filter(f => f.name.endsWith('.json') && !f.name.startsWith('_'));
 
-  const entries = await mapLimit(jsonFiles, FETCH_CONCURRENCY, async file => {
-    try {
-      const [contents] = await file.download();
-      const doc = JSON.parse(contents.toString());
-      if (!doc) return null;
-      return makeEntry(doc, file.name);
-    } catch (e) {
-      console.error('Skip file:', file.name, e.message);
-      return null;
-    }
-  });
+  let filesToFetch = jsonFiles;
+  if (loadedFromIndex && indexUpdatedTime) {
+    // Incremental: only fetch files modified after index was created
+    filesToFetch = jsonFiles.filter(f => {
+      if (!f.metadata || !f.metadata.updated) return true;
+      const modTime = new Date(f.metadata.updated).getTime();
+      return isNaN(modTime) || modTime >= indexUpdatedTime;
+    });
+    console.log(`Incremental cache check: ${filesToFetch.length} files modified since last index`);
+  }
 
-  const next = new Map();
-  for (const e of entries) {
-    if (e && e.path) next.set(e.path, e);
+  if (filesToFetch.length > 0) {
+    const entries = await mapLimit(filesToFetch, FETCH_CONCURRENCY, async file => {
+      try {
+        const [contents] = await file.download();
+        const doc = JSON.parse(contents.toString());
+        if (!doc) return null;
+        return makeEntry(doc, file.name);
+      } catch (e) {
+        console.error('Skip file:', file.name, e.message);
+        return null;
+      }
+    });
+
+    for (const e of entries) {
+      if (e && e.path) next.set(e.path, e);
+    }
   }
 
   // Preserve concurrent writes during cache rebuild
@@ -147,7 +231,13 @@ async function rebuildCache() {
   docCache = next;
   cacheBuiltAt = Date.now();
   lastRebuildMs = cacheBuiltAt - started;
-  console.log(`Cache rebuilt: ${next.size} docs in ${lastRebuildMs}ms (${jsonFiles.length} objects scanned)`);
+  console.log(`Cache rebuilt: ${next.size} docs in ${lastRebuildMs}ms (${jsonFiles.length} objects total, ${filesToFetch.length} fetched)`);
+
+  // If full scan or new items were fetched, schedule persistent index update
+  if (!loadedFromIndex || filesToFetch.length > 0) {
+    scheduleSaveIndex();
+  }
+
   return docCache;
 }
 
@@ -341,11 +431,14 @@ async function writeDoc(docPath, content, tags, overwrite = false, author = 'unk
 
   let isReservation = false;
   let currentGen = null;
+  let existingMeta = null;
+  let existingContent = null;
 
   try {
     const [exists] = await file.exists();
     if (exists) {
       const [meta] = await file.getMetadata();
+      existingMeta = meta;
       currentGen = meta.generation;
 
       const cached = docCache ? docCache.get(cleanPath) : null;
@@ -355,10 +448,32 @@ async function writeDoc(docPath, content, tags, overwrite = false, author = 'unk
         try {
           const [contents] = await file.download();
           const parsed = JSON.parse(contents.toString());
-          if (parsed && parsed.reserved && (!parsed.content || parsed.content.trim() === '')) {
-            isReservation = true;
+          if (parsed) {
+            existingContent = parsed.content || '';
+            if (parsed.reserved && (!parsed.content || parsed.content.trim() === '')) {
+              isReservation = true;
+            }
           }
         } catch (e) {}
+      }
+
+      const existingSize = existingMeta ? parseInt(existingMeta.size, 10) : (existingContent ? Buffer.byteLength(existingContent, 'utf8') : 0);
+      const existingUpdated = existingMeta ? existingMeta.updated : now;
+
+      // Check for exact content match (idempotent write no-op)
+      if (!isReservation && existingContent !== null && existingContent === (content || '')) {
+        upsertCache(cleanPath, content || '', tagsList, existingUpdated, false);
+        return {
+          success: true,
+          idempotent: true,
+          already_exists: true,
+          identical: true,
+          path: cleanPath,
+          bytes: existingSize,
+          last_modified: existingUpdated,
+          generation: currentGen,
+          message: `already exists, ${existingSize} bytes, last_modified ${existingUpdated} (identical content, no-op)`
+        };
       }
 
       // Preflight existence check: if exists and NOT a reservation and NOT overwrite -> Reject!
@@ -367,7 +482,10 @@ async function writeDoc(docPath, content, tags, overwrite = false, author = 'unk
           isError: true,
           error: 'DOC_EXISTS',
           path: cleanPath,
+          bytes: existingSize,
+          last_modified: existingUpdated,
           generation: currentGen,
+          message: `already exists, ${existingSize} bytes, last_modified ${existingUpdated}`,
           hint: 'pass overwrite:true, or call brain_allocate() for a fresh slot'
         };
       }
@@ -392,6 +510,7 @@ async function writeDoc(docPath, content, tags, overwrite = false, author = 'unk
 
   await file.save(payload, saveOpts);
   upsertCache(cleanPath, content || '', tagsList, now, false);
+  scheduleSaveIndex();
 
   // Write audit trail
   const byteCount = Buffer.byteLength(content || '', 'utf8');
@@ -399,10 +518,22 @@ async function writeDoc(docPath, content, tags, overwrite = false, author = 'unk
     console.error('Audit log append failed:', e.message);
   });
 
-  return { success: true, path: cleanPath, generation: currentGen };
+  const isOverwritten = Boolean(currentGen && !isReservation);
+  return {
+    success: true,
+    path: cleanPath,
+    generation: currentGen,
+    overwritten: isOverwritten,
+    previous_bytes: existingMeta ? parseInt(existingMeta.size, 10) : undefined,
+    previous_last_modified: existingMeta ? existingMeta.updated : undefined
+  };
 }
 
 async function readDoc(docPath) {
+  if (!docPath || typeof docPath !== 'string') {
+    throw new DocNotFoundError(docPath || '');
+  }
+
   if (docPath === '_sequence.counter' || docPath.endsWith('.counter')) {
     try {
       const [contents] = await storage.bucket(BUCKET).file(COUNTER_FILE).download();
@@ -432,7 +563,7 @@ async function readDoc(docPath) {
       // try next
     }
   }
-  throw new Error(`Document not found: ${docPath}`);
+  throw new DocNotFoundError(cleanPath);
 }
 
 // Tokenized Case-Insensitive Search with Recency Weighting
@@ -536,19 +667,50 @@ async function listDocs(args) {
   });
 
   const total_count = all.length;
-  const offset = Math.max(0, (args && typeof args.offset === 'number') ? args.offset : 0);
-  const requestedLimit = (args && typeof args.limit === 'number') ? args.limit : 50;
-  const limit = Math.min(Math.max(1, requestedLimit), 500);
+  const isLimitAll = Boolean(args && (args.limit === 'all' || args.limit === 0 || args.limit === -1));
 
-  const slice = all.slice(offset, offset + limit);
-  const has_more = (offset + slice.length) < total_count;
+  let offset = Math.max(0, (args && typeof args.offset === 'number') ? args.offset : 0);
+  let requestedLimit = 50;
+  if (args && typeof args.limit === 'number') {
+    requestedLimit = args.limit;
+  }
+
+  let limit = Math.min(Math.max(1, requestedLimit), 500);
+
+  // Support 1-based page parameter
+  let page = 1;
+  if (args && typeof args.page === 'number' && args.page >= 1) {
+    page = Math.floor(args.page);
+    offset = (page - 1) * limit;
+  } else {
+    page = Math.floor(offset / limit) + 1;
+  }
+
+  let slice;
+  let has_more;
+
+  if (isLimitAll) {
+    slice = all.slice(offset);
+    has_more = false;
+    limit = slice.length;
+  } else {
+    slice = all.slice(offset, offset + limit);
+    has_more = (offset + slice.length) < total_count;
+  }
+
+  const mappedDocs = slice.map(d => ({ path: d.path, tags: d.tags }));
+
+  if (args && args.flat) {
+    return mappedDocs;
+  }
 
   return {
-    docs: slice.map(d => ({ path: d.path, tags: d.tags })),
+    docs: mappedDocs,
     total_count,
     has_more,
     offset,
-    limit
+    limit: isLimitAll ? 'all' : limit,
+    page
   };
 }
 
@@ -602,25 +764,95 @@ async function brain_verify() {
   };
 }
 
+// Lightweight liveness and storage probe (Fix 5)
+async function pingStatus(checkStorage = true) {
+  let storageAccessible = false;
+  let storageLatencyMs = null;
+
+  if (checkStorage) {
+    const t0 = Date.now();
+    try {
+      const [exists] = await storage.bucket(BUCKET).file(COUNTER_FILE).exists();
+      storageLatencyMs = Date.now() - t0;
+      storageAccessible = exists;
+    } catch (e) {
+      storageLatencyMs = Date.now() - t0;
+      storageAccessible = false;
+    }
+  }
+
+  const mem = process.memoryUsage();
+  return {
+    status: 'ok',
+    server: {
+      name: 'mycelial-brain',
+      version: SERVER_VERSION,
+      uptime_seconds: Math.floor(process.uptime()),
+      memory_rss_mb: Math.round(mem.rss / 1024 / 1024),
+      memory_heap_mb: Math.round(mem.heapUsed / 1024 / 1024)
+    },
+    storage: {
+      bucket: BUCKET,
+      accessible: storageAccessible,
+      latency_ms: storageLatencyMs
+    },
+    cache: {
+      size: docCache ? docCache.size : 0,
+      age_ms: docCache ? (Date.now() - cacheBuiltAt) : null,
+      rebuild_in_flight: Boolean(rebuildPromise),
+      last_rebuild_ms: lastRebuildMs
+    },
+    timestamp: new Date().toISOString()
+  };
+}
+
 // Routes
-app.get('/', (_, res) => res.json({ name: 'mycelial-brain', version: '3.3.0', protocol: PROTOCOL_VERSION, status: 'ready' }));
+app.get('/', (_, res) => res.json({ name: 'mycelial-brain', version: SERVER_VERSION, protocol: PROTOCOL_VERSION, status: 'ready' }));
 
 app.get('/mcp', (_, res) => res.json({
   name: 'mycelial-brain',
-  version: '3.3.0',
+  version: SERVER_VERSION,
   protocol: PROTOCOL_VERSION,
   status: 'ready',
   transport: 'http',
   endpoint: '/mcp'
 }));
 
-app.get('/health', (_, res) => res.json({
-  status: 'ok',
-  cacheSize: docCache ? docCache.size : 0,
-  cacheAgeMs: docCache ? Date.now() - cacheBuiltAt : null,
-  lastRebuildMs,
-  rebuildInFlight: !!rebuildPromise
-}));
+app.get('/health', async (req, res) => {
+  const checkStorage = req.query.storage === 'true';
+  const status = await pingStatus(checkStorage);
+  return res.json(status);
+});
+
+app.get('/docs', async (req, res) => {
+  try {
+    const prefix = req.query.prefix || undefined;
+    const limit = req.query.limit === 'all' ? 'all' : (req.query.limit ? parseInt(req.query.limit, 10) : 50);
+    const offset = req.query.offset ? parseInt(req.query.offset, 10) : 0;
+    const page = req.query.page ? parseInt(req.query.page, 10) : undefined;
+    const flat = req.query.format === 'flat' || req.query.flat === 'true';
+
+    const result = await listDocs({ prefix, limit, offset, page, flat });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/brain/list', async (req, res) => {
+  try {
+    const prefix = req.query.prefix || undefined;
+    const limit = req.query.limit === 'all' ? 'all' : (req.query.limit ? parseInt(req.query.limit, 10) : 50);
+    const offset = req.query.offset ? parseInt(req.query.offset, 10) : 0;
+    const page = req.query.page ? parseInt(req.query.page, 10) : undefined;
+    const flat = req.query.format === 'flat' || req.query.flat === 'true';
+
+    const result = await listDocs({ prefix, limit, offset, page, flat });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.post('/rebuild', authMiddleware, async (_, res) => {
   try {
@@ -640,7 +872,7 @@ app.post('/mcp', authMiddleware, async (req, res) => {
         id,
         result: {
           protocolVersion: PROTOCOL_VERSION,
-          serverInfo: { name: 'mycelial_brain', version: '3.3.0' },
+          serverInfo: { name: 'mycelial_brain', version: SERVER_VERSION },
           capabilities: {
             tools: { listChanged: false }
           }
@@ -650,6 +882,16 @@ app.post('/mcp', authMiddleware, async (req, res) => {
 
     if (method === 'tools/list') {
       const tools = [
+        {
+          name: 'brain_ping',
+          description: 'Lightweight liveness and latency probe for brain server and GCS storage without listing documents',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              check_storage: { type: 'boolean', description: 'Whether to probe GCS storage latency (default true)' }
+            }
+          }
+        },
         {
           name: 'brain_search',
           description: 'Search the mycelial brain by keywords with tokenized scoring and recency weighting',
@@ -695,9 +937,11 @@ app.post('/mcp', authMiddleware, async (req, res) => {
           inputSchema: {
             type: 'object',
             properties: {
-              limit: { type: 'number', description: 'Number of documents to return (default 50, max 500)' },
+              limit: { description: "Number of documents to return (default 50, max 500), or 'all' for full enumeration" },
               offset: { type: 'number', description: 'Pagination offset (default 0)' },
-              prefix: { type: 'string', description: 'Optional prefix filter' }
+              page: { type: 'number', description: '1-based page number (alternative to offset)' },
+              prefix: { type: 'string', description: 'Optional prefix filter' },
+              flat: { type: 'boolean', description: 'If true, returns flat array of documents' }
             }
           }
         },
@@ -762,6 +1006,12 @@ app.post('/mcp', authMiddleware, async (req, res) => {
     if (method === 'tools/call') {
       const { name, arguments: args } = params || {};
 
+      if (name === 'brain_ping') {
+        const checkStorage = args && typeof args.check_storage === 'boolean' ? args.check_storage : true;
+        const pingRes = await pingStatus(checkStorage);
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(pingRes) }] } });
+      }
+
       if (name === 'brain_write') {
         const allowedNs = ['hermes/', 'bodhi/', 'm-agent/', 'kai/', 'sylvan/', 'arbor/', 'sequoia/', 'quercus/', 'antigravity/'];
         if (args.path) {
@@ -791,7 +1041,10 @@ app.post('/mcp', authMiddleware, async (req, res) => {
                 type: 'text',
                 text: JSON.stringify({
                   error: writeRes.error,
+                  message: writeRes.message,
                   path: writeRes.path,
+                  bytes: writeRes.bytes,
+                  last_modified: writeRes.last_modified,
                   generation: writeRes.generation,
                   hint: writeRes.hint
                 })
@@ -799,6 +1052,12 @@ app.post('/mcp', authMiddleware, async (req, res) => {
               isError: true
             }
           });
+        }
+        if (writeRes.identical) {
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: writeRes.message }] } });
+        }
+        if (writeRes.overwritten) {
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `Saved ${path} (overwritten, previous ${writeRes.previous_bytes} bytes, last_modified ${writeRes.previous_last_modified})` }] } });
         }
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Saved ' + path }] } });
       }
@@ -867,12 +1126,23 @@ app.post('/mcp', authMiddleware, async (req, res) => {
 
     res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
   } catch (e) {
-    res.json({ jsonrpc: '2.0', id, error: { code: -32603, message: e.message } });
+    const isNotFound = e instanceof DocNotFoundError || e.code === -32004 || (e.message && e.message.startsWith('Document not found'));
+    const errorCode = isNotFound ? -32004 : -32603;
+    const errorData = isNotFound ? { path: e.docPath || (params && params.arguments && params.arguments.path), code: 'NOT_FOUND' } : undefined;
+    res.json({
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: errorCode,
+        message: e.message,
+        ...(errorData ? { data: errorData } : {})
+      }
+    });
   }
 });
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Mycelial Brain v3.3.0 ready (MCP ${PROTOCOL_VERSION})`);
+  console.log(`Mycelial Brain v${SERVER_VERSION} ready (MCP ${PROTOCOL_VERSION})`);
   getDocIndex().catch(e => console.error('Warmup failed:', e.message));
 });
